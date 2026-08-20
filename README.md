@@ -3,89 +3,66 @@
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) desktop plugin that shows your **active session's AI provider usage** in the status bar.
 
 ```
-OC 5h 39% · W 15% · M 13%
+OC 5h 39% · W 15% · M 13%   Claude W 62% · M 40%   Codex W 10%
 ```
 
-- **Session-aware** — reads the focused/active session's own `/usage` output, so the chip always reflects the provider you are currently using. Switch sessions and it follows.
-- **No secrets** — uses the same gateway RPCs Hermes already owns (`slash.exec 'usage'`, `account.usage`, `usage.bars`). No API keys, no `.env`, no Python backend.
-- **Flexible windows** — a provider can report any number of limits (rolling / weekly / monthly / custom); the chip renders exactly what the data contains. Colour-coded green → amber → red as usage climbs.
-- **Extensible** — add a vendor to the `PROVIDERS` registry in `plugin.js` to give it a friendly name and a status-bar code.
+Session-aware: it reads the focused session's provider and shows **only that provider**. Switch sessions and the chip follows.
+
+## How it works (hybrid design)
+
+Not all providers can be read the same way. This plugin uses two paths:
+
+| Provider | Data source | Backend needed? |
+|----------|-------------|-----------------|
+| Claude, Codex, Cursor, Kimi, OpenRouter, Nous | Gateway RPCs `account.usage` / `usage.bars` (the gateway already holds their credentials) | **No** |
+| OpenCode Go, OpenCode Zen | Bundled Python backend → `https://opencode.ai/zen/(go\|zen)/v1/usage` (key from `.env`) | **Yes** |
+
+The gateway exposes a usage RPC for the first group but **not** for OpenCode (it treats OpenCode as a generic inference relay). So OpenCode is the only family that needs the Python backend + an API key.
 
 ## Install
 
-Copy the plugin folder into your Hermes desktop plugins directory:
-
 ```bash
-git clone https://github.com/meviusisback/opencode-usage.git /tmp/opencode-usage
-mkdir -p ~/.hermes/desktop-plugins
-cp -r /tmp/opencode-usage/desktop-plugins/opencode-usage ~/.hermes/desktop-plugins/
-```
-
-The desktop app hot-reloads within seconds. If it does not appear, run **"Reload desktop plugins"** from the command palette (⌘K).
-
-> Requirements: you must be signed into the provider you want to track (e.g. OpenCode Go). The plugin only reads usage Hermes can already see.
-
-## How it works
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Status bar chip (desktop/plugin.js)                              │
-│                                                                 │
-│  1. Reads active session id from host.state                     │
-│  2. Calls gateway RPCs (no keys, no network egress):            │
-│       slash.exec { command:'usage', session_id }  ← primary    │
-│       account.usage                              ← fallback     │
-│       usage.bars                                ← Nous fallback │
-│  3. Parses the returned windows (rolling/weekly/monthly/...)    │
-│  4. Renders "CODE label% · label% · ..." with colour coding     │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-All calls go through the desktop plugin SDK (`host.request` JSON-RPC) to the
-gateway that is already running on your machine. Nothing leaves the device
-except the same usage calls those providers already make for you.
-
-## Architecture
-
-This is a **single-file desktop plugin** — there is no Python backend.
-
-```
-opencode-usage/
-├── README.md
-├── LICENSE
-└── desktop-plugins/
-    └── opencode-usage/
-        ├── plugin.js      ← the entire plugin (UI + data fetch + parsers)
-        └── plugin.yaml    ← manifest (name, label, version)
-```
-
-Earlier versions shipped a Python backend that proxied the OpenCode API with
-a key read from `.env`. That was unnecessary: the gateway already exposes the
-same usage data through first-party RPCs, so the current plugin is pure
-front-end and needs no configuration, no credential files, and no backend
-process.
-
-## Adding a provider
-
-Open `desktop-plugins/opencode-usage/plugin.js` and add an entry to
-`PROVIDERS`:
-
-```js
-{ id: 'github-copilot', name: 'GitHub Copilot', short: 'GH', match: ['copilot', 'github copilot'] },
-```
-
-The `match` substrings are used to recognise the vendor in usage text and
-`account.usage` snapshots. Window limits are read from the data, so nothing
-else needs to change.
-
-## Updating
-
-```bash
+# 1. Desktop plugin (the status bar chip) — works for Claude/Codex/etc. immediately
 rm -rf ~/.hermes/desktop-plugins/opencode-usage
-cp -r /tmp/opencode-usage/desktop-plugins/opencode-usage ~/.hermes/desktop-plugins/
+mkdir -p ~/.hermes/desktop-plugins/opencode-usage
+cp desktop-plugins/opencode-usage/plugin.js ~/.hermes/desktop-plugins/opencode-usage/
+cp desktop-plugins/opencode-usage/plugin.yaml ~/.hermes/desktop-plugins/opencode-usage/
+
+# 2. (Optional) Python backend — only needed for OpenCode Go / Zen
+#    Copy the full repo so plugin.yaml's `api:` points at dashboard/plugin_api.py
+rm -rf ~/.hermes/plugins/opencode-usage
+git clone --depth 1 https://github.com/meviusisback/opencode-usage.git ~/.hermes/plugins/opencode-usage
 ```
 
-Then **"Reload desktop plugins"** (⌘K).
+Then in Hermes Desktop: **⌘K → "Reload desktop plugins"**.
+
+### Enabling the OpenCode backend
+
+OpenCode needs the Python backend mounted **and** the API key present:
+
+1. Make sure `~/.hermes/.env` contains `OPENCODE_GO_API_KEY=...` (and/or `OPENCODE_ZEN_API_KEY=...`).
+2. Ensure `opencode-usage` is in `plugins.enabled` in `~/.hermes/config.yaml`:
+
+   ```yaml
+   plugins:
+     enabled:
+       - opencode-usage
+   ```
+
+3. **Quit and reopen Hermes Desktop** (the backend loads at startup, not on hot-reload).
+
+Without the backend, gateway-native providers still work; OpenCode shows `OC ⚠` ("backend not enabled").
+
+## Add a provider
+
+- **Gateway-native** (Claude/Codex/... style): add an entry to `GATEWAY_PROVIDERS` in `plugin.js` with the window ids your provider returns.
+- **OpenCode-family** (needs a key): add an entry to `PROVIDERS` in `dashboard/plugin_api.py` with `id`, `key_env`, `endpoint`, and `windows`.
+
+## Security
+
+- API keys are read only from `~/.hermes/.env` (must be `0600`). They are **never** sent to the client.
+- All upstream errors are sanitized to a generic code (`auth-failed`, `network-error`, `upstream-error`).
+- TLS verification is enforced; response size is capped at 4 KB.
 
 ## License
 

@@ -1,237 +1,216 @@
 /**
- * OpenCode Go Usage — Hermes Desktop status bar chip.
+ * AI Usage — Hermes Desktop status bar chip (hybrid).
  *
- * Shows the ACTIVE session's AI provider usage in the status bar.
- * Session-aware by construction: it reads the focused/active session's
- * own `/usage` output, so the chip always reflects the provider you are
- * currently using — switch sessions and it follows.
+ * Two data sources, chosen per-provider:
  *
- * No API keys, no .env, no Python backend. All data comes from the same
- * gateway RPCs Hermes already uses for usage display:
- *   - slash.exec { command: 'usage', session_id }   (session-scoped)
- *   - account.usage                                 (signed-in vendors)
- *   - usage.bars                                   (Nous Portal)
+ *  1. GATEWAY-NATIVE providers (Claude, Codex, Cursor, Kimi, OpenRouter, Nous)
+ *     are read DIRECTLY from the gateway RPCs `account.usage` / `usage.bars`.
+ *     No backend, no API keys, no .env — the gateway already holds their creds.
  *
- * Extensible: add an entry to PROVIDERS to give any vendor a friendly
- * name and status-bar code. Window limits are NOT hardcoded — they are
- * read from the parsed usage data, so a provider can declare any number
- * of windows (rolling / weekly / monthly / custom) and the chip adapts.
+ *  2. OPENCODE family (opencode-go, opencode-zen) has NO gateway RPC (the gateway
+ *     treats them as generic inference relays). Their quota is fetched by the
+ *     bundled Python backend (dashboard/plugin_api.py), which reads the key from
+ *     .env and calls https://opencode.ai/zen/(go|zen)/v1/usage.
+ *
+ * The chip is session-aware: it reads the active session's provider from
+ * host.state.model (or the focused session) and shows ONLY that provider.
+ *
+ * Install: copy this folder to ~/.hermes/desktop-plugins/opencode-usage/
+ * (The Python backend is optional; without it, only gateway-native providers show.)
  */
-import * as sdk from '@hermes/plugin-sdk'
+import { host, Tip, cn } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useState, useEffect, useCallback, useMemo } from 'react'
 
-const PLUGIN_ID = 'opencode-usage'
+const ID = 'opencode-usage'
 const REFRESH_MS = 60000
+let backendRest = null  // set in register() if a Python backend is mounted
 
-const host = sdk.host
-const { useValue, Tip, cn } = sdk
+// Which providers are read from the gateway RPCs (no backend needed).
+const GATEWAY_PROVIDERS = {
+  anthropic: { name: 'Claude', windows: [{ id: 'weekly', label: 'W' }, { id: 'monthly', label: 'M' }] },
+  'openai-codex': { name: 'Codex', windows: [{ id: 'weekly', label: 'W' }, { id: 'monthly', label: 'M' }] },
+  cursor: { name: 'Cursor', windows: [{ id: 'weekly', label: 'W' }, { id: 'monthly', label: 'M' }] },
+  kimi: { name: 'Kimi', windows: [{ id: 'weekly', label: 'W' }, { id: 'monthly', label: 'M' }] },
+  'kimi-coding': { name: 'Kimi', windows: [{ id: 'weekly', label: 'W' }, { id: 'monthly', label: 'M' }] },
+  openrouter: { name: 'OpenRouter', windows: [{ id: 'daily', label: 'D' }, { id: 'monthly', label: 'M' }] },
+  nous: { name: 'Nous Portal', windows: [{ id: 'monthly', label: 'M' }] },
+}
+// OpenCode family -> fetched via the Python backend.
+const BACKEND_PROVIDERS = ['opencode-go', 'opencode-zen']
 
-// --- Provider registry (extensible) ------------------------------------
-// match: substrings used to recognise this vendor in usage text / snapshots.
-// Windows come from the parsed data, not from here — add a vendor and the
-// chip automatically shows whatever limits that vendor reports.
-const PROVIDERS = [
-  { id: 'opencode-go', name: 'OpenCode Go', short: 'OC', match: ['opencode', 'opencode go', 'opencode-go'] },
-  { id: 'nous', name: 'Nous Portal', short: 'NS', match: ['nous'] },
-  { id: 'anthropic', name: 'Claude', short: 'CL', match: ['anthropic', 'claude'] },
-  { id: 'openai-codex', name: 'Codex', short: 'CX', match: ['codex', 'openai-codex'] },
-  { id: 'cursor', name: 'Cursor', short: 'CU', match: ['cursor'] },
-  { id: 'kimi', name: 'Kimi', short: 'KI', match: ['kimi'] },
-  { id: 'openrouter', name: 'OpenRouter', short: 'OR', match: ['openrouter'] },
-]
-
-function findProvider(label) {
-  const l = String(label || '').toLowerCase()
-  return PROVIDERS.find(p => p.match.some(m => l.includes(m))) || null
+function formatPercent(val) {
+  if (val == null || isNaN(val)) return '—'
+  return Math.round(val) + '%'
+}
+function statusColor(percent) {
+  if (percent == null) return 'var(--ui-text-quaternary)'
+  if (percent >= 90) return '#ef4444'
+  if (percent >= 70) return '#f59e0b'
+  return '#22c55e'
+}
+function shortName(name) {
+  if (!name) return '??'
+  return name.split(' ').map(w => w[0]).join('')
 }
 
-function shortCode(name) {
-  const p = PROVIDERS.find(x => x.name.toLowerCase() === String(name).toLowerCase())
-  return p ? p.short : String(name || '??').split(' ').map(w => w[0]).join('').slice(0, 2)
+// Derive provider id from the active session's model string or session info.
+function providerFromModel(model) {
+  if (!model || typeof model !== 'string') return null
+  const slash = model.indexOf('/')
+  return slash > 0 ? model.slice(0, slash) : null
 }
 
-// --- Helpers -----------------------------------------------------------
-function clampPct(n) {
-  const v = Number(n)
-  if (!Number.isFinite(v)) return null
-  return Math.max(0, Math.min(100, Math.round(v)))
-}
-
-function statusColor(used) {
-  if (used == null) return 'var(--ui-text-quaternary)'
-  if (used >= 90) return 'var(--ui-red)'
-  if (used >= 70) return 'var(--ui-yellow)'
-  return 'var(--ui-green)'
-}
-
-// Normalise a raw window label to a compact status-bar token.
-function windowLabel(raw) {
-  const l = String(raw || '').toLowerCase()
-  if (/(roll|5h|hour|daily)/.test(l)) return '5h'
-  if (/week/.test(l)) return 'W'
-  if (/month/.test(l)) return 'M'
-  return raw
-}
-
-// Parse one "Label: NN% used / remaining" line into a window.
-function parseWindowLine(line) {
-  let m = line.match(/^(.+?):\s*(\d+)%\s*remaining\s*\((\d+)%\s*used\)/i)
-  if (m) return { label: windowLabel(m[1]), remaining: clampPct(m[2]), used: clampPct(m[3]) }
-  m = line.match(/^(.+?):\s*(\d+)%\s*used\s*\((\d+)%\s*remaining\)/i)
-  if (m) return { label: windowLabel(m[1]), used: clampPct(m[2]), remaining: clampPct(m[3]) }
-  m = line.match(/^(.+?):\s*(\d+)%\s*used/i)
-  if (m) return { label: windowLabel(m[1]), used: clampPct(m[2]), remaining: clampPct(100 - m[2]) }
-  m = line.match(/^(.+?):\s*(\d+)%/i)
-  if (m) return { label: windowLabel(m[1]), used: clampPct(m[2]), remaining: clampPct(100 - m[2]) }
-  return null
-}
-
-function parseUsageText(text) {
-  const windows = []
-  for (const raw of String(text || '').split('\n')) {
-    const line = raw.replace(/\*\*/g, '').replace(/^📈\s*/, '').trim()
-    if (!line) continue
-    if (/^(account limits|session (token )?usage|session info|rate limits|nous credits)\b/i.test(line)) continue
-    const w = parseWindowLine(line)
-    if (w && w.label) windows.push(w)
-  }
-  return windows
-}
-
-// --- Data fetch (session-aware) ----------------------------------------
-async function fetchActiveUsage(sessionId) {
-  const sid = sessionId || ''
-
-  // 1. Session-scoped /usage — inherently the active provider.
-  try {
-    const r = await host.request('slash.exec', { command: 'usage', session_id: sid })
-    const text = (r && typeof r.output === 'string') ? r.output : ''
-    const windows = parseUsageText(text)
-    if (windows.length) {
-      const prov = findProvider(text) || { name: 'OpenCode Go', short: 'OC' }
-      return { provider: prov, windows }
-    }
-  } catch (e) { /* fall through */ }
-
-  // 2. account.usage snapshots (all signed-in vendors).
-  try {
-    const acc = await host.request('account.usage', {})
-    const snaps = (acc && acc.snapshots) || []
-    for (const snap of snaps) {
-      const prov = findProvider(snap.provider)
-      if (!prov) continue
-      const wins = (snap.windows || []).map(w => ({
-        label: windowLabel(w.label || ''),
-        used: clampPct(w.used_percent != null ? w.used_percent : w.used),
-        remaining: clampPct(w.remaining_percent != null ? w.remaining_percent : w.remaining),
-      })).filter(w => w.label)
-      if (wins.length) return { provider: prov, windows: wins }
-    }
-  } catch (e) { /* fall through */ }
-
-  // 3. Nous Portal bars.
-  try {
-    const bars = await host.request('usage.bars', {})
-    if (bars && bars.available !== false) {
-      const wins = []
-      const push = (bar, label) => {
-        if (!bar) return
-        const used = clampPct(bar.pct_used)
-        if (used != null) wins.push({ label, used, remaining: clampPct(100 - used) })
-      }
-      push(bars.plan_bar, 'Sub')
-      if (bars.has_topup) push(bars.topup_bar, 'Top-up')
-      if (wins.length) return { provider: { name: 'Nous Portal', short: 'NS' }, windows: wins }
-    }
-  } catch (e) { /* ignore */ }
-
-  return null
-}
-
-// --- Components --------------------------------------------------------
-function WindowBadge({ label, used }) {
-  const color = statusColor(used)
-  const tip = `${label}: ${used == null ? '—' : used + '% used'}`
+function WindowBadge(props) {
+  const { label, percent, resetsAt } = props
+  const color = statusColor(percent)
+  const tip = resetsAt
+    ? label + ': ' + formatPercent(percent) + ' used — resets ' + new Date(resetsAt).toLocaleString()
+    : label + ': ' + formatPercent(percent) + ' used'
   return jsx(Tip, {
     label: tip,
     children: jsx('span', {
       className: 'inline-flex items-center gap-0.5 text-[0.625rem] font-mono',
       children: [
         jsx('span', { className: 'text-(--ui-text-quaternary)', children: label }),
-        jsx('span', { style: { color }, children: used == null ? '—' : used + '%' }),
+        jsx('span', { style: { color: color }, children: formatPercent(percent) }),
       ],
     }),
   })
 }
 
-function Chip() {
-  const focusedSid = useValue(host.state.focusedSessionId)
-  const activeSid = useValue(host.state.activeSessionId)
-  const sid = useMemo(() => focusedSid || activeSid || '', [focusedSid, activeSid])
-
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-
-  const load = useCallback(async () => {
-    const id = focusedSid || activeSid || ''
-    if (!id) { setData(null); setError(null); return }
-    try {
-      const result = await fetchActiveUsage(id)
-      if (result && result.windows.length) { setData(result); setError(null) }
-      else { setData(null); setError('no-data') }
-    } catch (e) {
-      setData(null); setError('connection-failed')
-    }
-  }, [focusedSid, activeSid])
-
-  useEffect(() => {
-    load()
-    const t = setInterval(load, REFRESH_MS)
-    return () => clearInterval(t)
-  }, [load])
-
-  if (error && !data) {
-    const label = error === 'connection-failed' ? 'connection failed' : 'no usage data'
+function ProviderChip(props) {
+  const { provider, windows, usage, error } = props
+  if (error && !usage) {
     return jsx(Tip, {
-      label: 'OpenCode usage — ' + label,
-      children: jsx('span', {
-        className: 'inline-flex items-center px-1.5 text-[0.625rem] text-(--ui-text-quaternary)',
-        children: 'OC ⚠',
-      }),
+      label: provider + ' — ' + error,
+      children: jsx('span', { className: 'inline-flex items-center gap-0.5 text-[0.625rem] text-(--ui-text-quaternary)', children: shortName(provider) + ' ⚠' }),
     })
   }
-  if (!data) return null
-
-  const { provider, windows } = data
-  const code = provider.short || shortCode(provider.name)
   const badges = []
-  windows.forEach((w, i) => {
+  for (let i = 0; i < windows.length; i++) {
+    const w = windows[i]
+    const data = usage && usage[w.id]
     if (i > 0) badges.push(jsx('span', { key: 's' + i, className: 'text-(--ui-text-quaternary)', children: '·' }))
-    badges.push(jsx(WindowBadge, { key: w.label + i, label: w.label, used: w.used }))
-  })
+    badges.push(jsx(WindowBadge, { key: w.id, label: w.label, percent: data && data.percent, resetsAt: data && data.resetsAt }))
+  }
   return jsx(Tip, {
-    label: provider.name + ' usage',
-    children: jsx('span', {
-      className: 'inline-flex items-center gap-0.5 text-[0.625rem] font-mono',
-      children: [
-        jsx('span', { className: 'text-(--ui-text-quaternary) font-semibold', children: code }),
-      ].concat(badges),
-    }),
+    label: provider + ' (' + windows.map(w => w.label).join(' / ') + ')',
+    children: jsx('span', { className: 'inline-flex items-center gap-0.5 text-[0.625rem] font-mono', children: [
+      jsx('span', { className: 'text-(--ui-text-quaternary) font-semibold', children: shortName(provider) }),
+    ].concat(badges) }),
   })
 }
 
+// ---- Gateway-native fetch (Claude/Codex/Cursor/Kimi/OpenRouter/Nous) --------
+function parseGatewaySnapshots(account, bars) {
+  // account.usage -> { snapshots: [{ provider, windows: {id:{percent,resetsAt,status}} }] }
+  // usage.bars    -> { plan_bar, topup_bar } (Nous)
+  const out = {}
+  const snaps = (account && account.snapshots) || []
+  for (const s of snaps) {
+    const pid = s.provider
+    if (!pid) continue
+    const wins = {}
+    const ws = s.windows || {}
+    for (const k of Object.keys(ws)) wins[k] = { status: ws[k].status || 'ok', percent: ws[k].percent, resetsAt: ws[k].resetsAt }
+    out[pid] = wins
+  }
+  if (bars && (bars.plan_bar || bars.topup_bar)) {
+    const nb = {}
+    if (bars.plan_bar) nb.monthly = { status: 'ok', percent: bars.plan_bar.percent_used ?? bars.plan_bar.percent, resetsAt: bars.plan_bar.resets_at }
+    if (bars.topup_bar) nb.topup = { status: 'ok', percent: bars.topup_bar.percent_used ?? bars.topup_bar.percent, resetsAt: bars.topup_bar.resets_at }
+    out.nous = nb
+  }
+  return out
+}
+
+function UsageChip() {
+  const [providerData, setProviderData] = useState(null)
+  const [activeProvider, setActiveProvider] = useState(null)
+  const [windows, setWindows] = useState([])
+  const [error, setError] = useState(null)
+  const restFn = useMemo(() => backendRest, [])
+
+  // Detect active provider from the focused/active session.
+  useEffect(() => {
+    let cancelled = false
+    const detect = () => {
+      const sid = host.state.activeSessionId?.get?.() || host.state.focusedSessionId?.get?.()
+      const model = host.state.model?.get?.()
+      const pid = providerFromModel(model) || (sid ? null : null)
+      if (!cancelled) setActiveProvider(pid || 'opencode-go') // default to opencode-go for this setup
+    }
+    detect()
+    const t = setInterval(detect, 5000)
+    return () => { cancelled = true; clearInterval(t) }
+  }, [])
+
+  const fetchGateway = useCallback(async (pid) => {
+    const [acc, bars] = await Promise.all([
+      host.request('account.usage', {}).catch(() => null),
+      host.request('usage.bars', {}).catch(() => null),
+    ])
+    const parsed = parseGatewaySnapshots(acc, bars)
+    return parsed[pid] ? { windows: GATEWAY_PROVIDERS[pid].windows, usage: parsed[pid] } : null
+  }, [])
+
+  const fetchBackend = useCallback(async (pid) => {
+    if (!restFn) throw new Error('backend-unavailable')
+    const resp = await restFn('/usage/' + pid, { method: 'GET', timeoutMs: 20000 })
+    if (resp && resp.error) throw new Error(resp.error)
+    return { windows: BACKEND_PROVIDERS.includes(pid) ? [{ id: 'rolling', label: '5h' }, { id: 'weekly', label: 'W' }, { id: 'monthly', label: 'M' }] : [], usage: resp.windows }
+  }, [restFn])
+
+  useEffect(() => {
+    if (!activeProvider) return
+    let cancelled = false
+    const load = async () => {
+      try {
+        let result
+        if (GATEWAY_PROVIDERS[activeProvider]) {
+          result = await fetchGateway(activeProvider)
+          if (!result) { setError('no-data'); setProviderData(null); return }
+          setWindows(result.windows); setProviderData(result.usage); setError(null)
+        } else if (BACKEND_PROVIDERS.includes(activeProvider)) {
+          result = await fetchBackend(activeProvider)
+          setWindows(result.windows); setProviderData(result.usage); setError(null)
+        } else {
+          setError('unsupported-provider'); setProviderData(null)
+        }
+      } catch (e) {
+        if (cancelled) return
+        setError(String(e.message || e))
+        setProviderData(null)
+      }
+    }
+    load()
+    const timer = setInterval(load, REFRESH_MS)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [activeProvider, fetchGateway, fetchBackend])
+
+  if (!activeProvider) return null
+  const name = (GATEWAY_PROVIDERS[activeProvider] && GATEWAY_PROVIDERS[activeProvider].name) || activeProvider
+  if (error && !providerData) {
+    return jsx(Tip, {
+      label: name + (error === 'backend-unavailable' ? ' — backend not enabled' : ' — ' + error),
+      children: jsx('span', { className: 'inline-flex items-center gap-0.5 text-[0.625rem] text-(--ui-text-quaternary)', children: shortName(name) + ' ⚠' }),
+    })
+  }
+  return jsx(ProviderChip, { provider: name, windows: windows, usage: providerData, error: error })
+}
+
 export default {
-  id: PLUGIN_ID,
-  name: 'OpenCode Go Usage',
-  description: 'Shows the active session AI provider usage in the status bar.',
+  id: ID,
+  name: 'AI Usage',
   defaultEnabled: true,
   register(ctx) {
+    if (ctx.rest) backendRest = ctx.rest.bind(ctx)
     ctx.register({
       id: 'chip',
       area: 'statusBar.right',
-      order: 90,
-      render: () => jsx(Chip, {}),
+      order: 1000,
+      render: () => jsx(UsageChip, {}),
     })
   },
 }

@@ -1,4 +1,5 @@
 name: opencode-usage
 label: AI Usage
-description: Show the active session's AI provider usage in the status bar (OpenCode Go and more).
+description: Show the active session's AI provider usage in the status bar (Claude, Codex, Cursor, Kimi, OpenRouter, Nous — and OpenCode Go/Zen via the bundled backend).
 version: 0.2.0
+api: dashboard/plugin_api.py
